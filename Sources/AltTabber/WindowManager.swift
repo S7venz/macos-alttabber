@@ -181,20 +181,68 @@ enum WindowManager {
 
     // MARK: - Focus
 
-    /// Un-minimize (if needed) then raise + focus the window. Uses SkyLight so it
-    /// works even when the window is on another Space.
-    static func focus(_ window: WindowInfo) {
-        if window.isMinimized, let axWindow = window.axElement {
-            AXUIElementSetAttributeValue(axWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-        }
+    /// Serial queue so rapid successive focuses never run concurrent SLPS
+    /// front-switches that race and cancel each other out.
+    private static let focusQueue = DispatchQueue(label: "com.vibecode.alttabber.focus")
 
-        if !SkyLight.raise(window.id, pid: window.pid) {
-            // Fallback if the process couldn't be resolved.
-            if let axWindow = window.axElement {
-                AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
-                AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
+    /// Un-minimize (if needed) then raise + focus the window. SkyLight handles
+    /// cross-Space and cross-display targets; a follow-up AX raise (re-acquired
+    /// once the window is on the current Space) makes it reliable.
+    ///
+    /// Runs on a serial background queue: focusing must not run inside the
+    /// CGEvent-tap callback (the WindowServer stalls until the callback returns).
+    static func focus(_ window: WindowInfo) {
+        focusQueue.async {
+            if window.isMinimized, let axWindow = window.axElement {
+                AXUIElementSetAttributeValue(axWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+                usleep(50_000)
             }
-            NSRunningApplication(processIdentifier: window.pid)?.activate(options: [])
+
+            // If the window sits on a Space not currently shown on ITS display,
+            // switch that display to it first (per-display — required for
+            // multi-monitor, where each display has its own current Space).
+            if let target = SkyLight.spaceOfWindow(window.id),
+               let display = SkyLight.displayOfSpace(target),
+               SkyLight.currentSpace(ofDisplay: display) != target {
+                DispatchQueue.main.sync { SkyLight.setCurrentSpace(target, display: display) }
+                for _ in 0..<80 where SkyLight.currentSpace(ofDisplay: display) != target {
+                    usleep(15_000)
+                }
+            }
+
+            SkyLight.raiseWindow(window.id, pid: window.pid)
+            axRaise(wid: window.id, pid: window.pid, cached: window.axElement)
         }
+    }
+
+    /// Raise + focus via Accessibility. Uses the cached element when we have one
+    /// (current Space at enumeration time); otherwise re-acquires it now — after
+    /// the SkyLight front-switch the window is on the current Space, so it shows
+    /// up in the app's AX window list. Retries a few times to ride out the Space
+    /// transition.
+    private static func axRaise(wid: CGWindowID, pid: pid_t, cached: AXUIElement?) {
+        for _ in 0..<5 {
+            if let element = cached ?? axElement(forWid: wid, pid: pid) {
+                AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+                AXUIElementSetAttributeValue(element, kAXMainAttribute as CFString, kCFBooleanTrue)
+                AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                return
+            }
+            usleep(40_000)
+        }
+    }
+
+    /// Look up the live AX window element for a CGWindowID within its app.
+    private static func axElement(forWid wid: CGWindowID, pid: pid_t) -> AXUIElement? {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.25)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else { return nil }
+        for element in windows {
+            var id: CGWindowID = 0
+            if _AXUIElementGetWindow(element, &id) == .success, id == wid { return element }
+        }
+        return nil
     }
 }

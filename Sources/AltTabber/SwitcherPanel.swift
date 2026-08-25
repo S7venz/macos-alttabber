@@ -1,6 +1,14 @@
 import AppKit
 import SwiftUI
 
+/// Hosting view that accepts clicks even while the panel isn't the key window —
+/// otherwise macOS swallows the first click on a non-active panel.
+private final class ClickableHostingView: NSHostingView<SwitcherView> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    required init(rootView: SwitcherView) { super.init(rootView: rootView) }
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+}
+
 /// A borderless, non-activating floating panel that hosts the SwiftUI overlay.
 /// It never becomes key, so the app underneath keeps its focus until we commit.
 final class SwitcherPanel: NSPanel {
@@ -23,8 +31,9 @@ final class SwitcherPanel: NSPanel {
         hasShadow = false            // the SwiftUI card draws its own shadow
         hidesOnDeactivate = false
         animationBehavior = .none
+        acceptsMouseMovedEvents = true   // needed for hover-to-highlight
 
-        let hosting = NSHostingView(rootView: SwitcherView(model: model))
+        let hosting = ClickableHostingView(rootView: SwitcherView(model: model))
         hosting.frame = contentView?.bounds ?? .zero
         hosting.autoresizingMask = [.width, .height]
         contentView = hosting

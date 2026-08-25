@@ -16,7 +16,10 @@ let package = Package(
                 .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("Carbon"),
-                .linkedFramework("QuartzCore")
+                .linkedFramework("QuartzCore"),
+                // SkyLight is a private framework — needed for cross-Space window
+                // raising (_SLPSSetFrontProcessWithOptions / SLPSPostEventRecordTo).
+                .unsafeFlags(["-F", "/System/Library/PrivateFrameworks", "-framework", "SkyLight"])
             ]
         )
     ]

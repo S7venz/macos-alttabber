@@ -3,113 +3,124 @@ import ApplicationServices
 import CoreGraphics
 import ScreenCaptureKit
 
-/// Discovers windows across all Spaces (including minimized / occluded / other
-/// desktops) via the Accessibility API, captures thumbnails (ScreenCaptureKit),
-/// and raises/focuses a target window.
+/// Discovers windows across all Spaces, captures thumbnails (ScreenCaptureKit),
+/// and raises/focuses a target window (Accessibility on the current Space,
+/// SkyLight for windows on other Spaces).
 enum WindowManager {
 
     // MARK: - Enumeration
 
-    /// All switchable windows. On-screen windows come first in front-to-back
-    /// z-order; minimized / off-Space windows follow.
+    /// All switchable windows. On-screen windows come first (front-to-back
+    /// z-order); minimized / off-Space windows follow.
     ///
     /// - Parameters:
-    ///   - includeMinimized: keep minimized windows in the list.
-    ///   - allSpaces: include windows that live on other Spaces / desktops.
+    ///   - includeMinimized: keep minimized windows.
+    ///   - allSpaces: include windows on other Spaces / desktops.
     static func listWindows(
         excludingPID ownPID: pid_t,
         includeMinimized: Bool,
         allSpaces: Bool
     ) -> [WindowInfo] {
-        // 1) Front-to-back z-order of the windows currently on screen (CG list).
+        // 1) Front-to-back z-order of the windows on the current Space.
         var zOrder: [CGWindowID: Int] = [:]
-        if let raw = CGWindowListCopyWindowInfo(
+        if let onscreen = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
         ) as? [[String: Any]] {
-            for (index, entry) in raw.enumerated() {
+            for (index, entry) in onscreen.enumerated() {
                 if let num = entry[kCGWindowNumber as String] as? CGWindowID, zOrder[num] == nil {
                     zOrder[num] = index
                 }
             }
         }
 
-        // 2) Every window of every regular app, via Accessibility.
-        var result: [WindowInfo] = []
-        let apps = NSWorkspace.shared.runningApplications.filter {
-            $0.activationPolicy == .regular && $0.processIdentifier != ownPID && !$0.isTerminated
-        }
-
-        for app in apps {
-            let pid = app.processIdentifier
-            let appElement = AXUIElementCreateApplication(pid)
-            // Don't let an unresponsive app stall the switcher.
+        // 2) Accessibility pass: minimized flags + element map (current Space only).
+        var minimizedIDs = Set<CGWindowID>()
+        var axByID: [CGWindowID: AXUIElement] = [:]
+        for app in NSWorkspace.shared.runningApplications
+            where app.activationPolicy == .regular && app.processIdentifier != ownPID && !app.isTerminated {
+            let appElement = AXUIElementCreateApplication(app.processIdentifier)
             AXUIElementSetMessagingTimeout(appElement, 0.25)
-
             var windowsValue: CFTypeRef?
             guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsValue) == .success,
                   let axWindows = windowsValue as? [AXUIElement] else { continue }
-
-            let appName = app.localizedName ?? ""
-            let icon = app.icon
-
             for axWindow in axWindows {
-                // Only real top-level windows (skip palettes, toolbars, sheets…).
-                guard axString(axWindow, kAXRoleAttribute) == (kAXWindowRole as String) else { continue }
-                if let subrole = axString(axWindow, kAXSubroleAttribute),
-                   subrole != (kAXStandardWindowSubrole as String),
-                   subrole != (kAXDialogSubrole as String) {
-                    continue
-                }
-
                 var wid: CGWindowID = 0
-                let hasWID = _AXUIElementGetWindow(axWindow, &wid) == .success && wid != 0
-                let minimized = axBool(axWindow, kAXMinimizedAttribute) ?? false
-                let title = axString(axWindow, kAXTitleAttribute) ?? ""
-                let bounds = axFrame(axWindow) ?? .zero
-
-                // Drop tiny helper windows, but never drop a minimized one on size.
-                if !minimized && (bounds.width < 60 || bounds.height < 60) { continue }
-                // Junk with neither a window id nor a title isn't switch-worthy.
-                if !hasWID && title.isEmpty { continue }
-
-                // Stable identity: real CGWindowID when available, else a synthetic
-                // id kept out of the normal (small, increasing) CGWindowID range.
-                let identity: CGWindowID = hasWID
-                    ? wid
-                    : (0xF000_0000 | (CGWindowID(truncatingIfNeeded: CFHash(axWindow)) & 0x0FFF_FFFF))
-
-                // Apply user filters.
-                if minimized && !includeMinimized { continue }
-                let onCurrentSpace = zOrder[identity] != nil
-                if !allSpaces && !onCurrentSpace && !minimized { continue }
-
-                result.append(
-                    WindowInfo(
-                        id: identity,
-                        pid: pid,
-                        appName: appName,
-                        title: title,
-                        appIcon: icon,
-                        bounds: bounds,
-                        isMinimized: minimized,
-                        axElement: axWindow
-                    )
-                )
+                guard _AXUIElementGetWindow(axWindow, &wid) == .success, wid != 0 else { continue }
+                axByID[wid] = axWindow
+                if axBool(axWindow, kAXMinimizedAttribute) == true { minimizedIDs.insert(wid) }
             }
         }
 
-        // 3) On-screen windows first (by z-order), everything else after.
+        // 3) Full window list (all Spaces), filtered down to real, switchable windows.
+        guard let all = CGWindowListCopyWindowInfo(
+            [.excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] else { return [] }
+
+        var iconCache: [pid_t: NSImage?] = [:]
+        func icon(for pid: pid_t) -> NSImage? {
+            if let cached = iconCache[pid] { return cached }
+            let image = NSRunningApplication(processIdentifier: pid)?.icon
+            iconCache[pid] = image
+            return image
+        }
+        var regularCache: [pid_t: Bool] = [:]
+        func isRegular(_ pid: pid_t) -> Bool {
+            if let cached = regularCache[pid] { return cached }
+            let regular = NSRunningApplication(processIdentifier: pid)?.activationPolicy == .regular
+            regularCache[pid] = regular
+            return regular
+        }
+
+        var result: [WindowInfo] = []
+        for entry in all {
+            guard
+                (entry[kCGWindowLayer as String] as? Int) == 0,
+                let pid = entry[kCGWindowOwnerPID as String] as? pid_t, pid != ownPID,
+                let num = entry[kCGWindowNumber as String] as? CGWindowID,
+                isRegular(pid)
+            else { continue }
+
+            if let alpha = entry[kCGWindowAlpha as String] as? Double, alpha < 0.05 { continue }
+
+            var bounds = CGRect.zero
+            if let b = entry[kCGWindowBounds as String] as? [String: Any],
+               let rect = CGRect(dictionaryRepresentation: b as CFDictionary) {
+                bounds = rect
+            }
+            if bounds.width < 60 || bounds.height < 60 { continue }
+
+            let ownerName = entry[kCGWindowOwnerName as String] as? String ?? ""
+            let title = entry[kCGWindowName as String] as? String ?? ""
+            let visible = zOrder[num] != nil
+            let minimized = minimizedIDs.contains(num)
+
+            // Filters.
+            if minimized && !includeMinimized { continue }
+            if !allSpaces && !visible && !minimized { continue }
+            // Off-screen windows with no title are almost always helper/placeholder
+            // windows; keep only titled ones (visible windows may legitimately be untitled).
+            if !visible && title.isEmpty { continue }
+
+            result.append(
+                WindowInfo(
+                    id: num,
+                    pid: pid,
+                    appName: ownerName,
+                    title: title,
+                    appIcon: icon(for: pid),
+                    bounds: bounds,
+                    isMinimized: minimized,
+                    axElement: axByID[num]
+                )
+            )
+        }
+
+        // On-screen windows first (z-order), everything else after (stable).
         result.sort { (zOrder[$0.id] ?? Int.max) < (zOrder[$1.id] ?? Int.max) }
         return result
     }
 
     // MARK: - Accessibility helpers
-
-    private static func axString(_ element: AXUIElement, _ attribute: String) -> String? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
-        return value as? String
-    }
 
     private static func axBool(_ element: AXUIElement, _ attribute: String) -> Bool? {
         var value: CFTypeRef?
@@ -117,29 +128,11 @@ enum WindowManager {
         return (value as? NSNumber)?.boolValue
     }
 
-    private static func axFrame(_ element: AXUIElement) -> CGRect? {
-        var posValue: CFTypeRef?
-        var sizeValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posValue) == .success,
-              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue) == .success
-        else { return nil }
-
-        var point = CGPoint.zero
-        var size = CGSize.zero
-        if let posValue, CFGetTypeID(posValue) == AXValueGetTypeID() {
-            AXValueGetValue(posValue as! AXValue, .cgPoint, &point)
-        }
-        if let sizeValue, CFGetTypeID(sizeValue) == AXValueGetTypeID() {
-            AXValueGetValue(sizeValue as! AXValue, .cgSize, &size)
-        }
-        return CGRect(origin: point, size: size)
-    }
-
     // MARK: - Thumbnails (ScreenCaptureKit)
 
     /// Captures thumbnails for the given windows concurrently, delivering each
     /// image to `onImage` (on the main actor) as soon as it is ready. Only
-    /// on-screen (capturable) windows produce an image; the rest keep their
+    /// capturable (on-screen) windows produce an image; the rest keep their
     /// app-icon placeholder.
     static func captureThumbnails(
         for windows: [WindowInfo],
@@ -188,17 +181,20 @@ enum WindowManager {
 
     // MARK: - Focus
 
-    /// Un-minimize (if needed), raise, and focus the given window, then activate
-    /// its owning application. Uses the window's cached AX element directly.
+    /// Un-minimize (if needed) then raise + focus the window. Uses SkyLight so it
+    /// works even when the window is on another Space.
     static func focus(_ window: WindowInfo) {
-        if let axWindow = window.axElement {
-            if window.isMinimized {
-                AXUIElementSetAttributeValue(axWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-            }
-            AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
-            AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
-            AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        if window.isMinimized, let axWindow = window.axElement {
+            AXUIElementSetAttributeValue(axWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
         }
-        NSRunningApplication(processIdentifier: window.pid)?.activate(options: [])
+
+        if !SkyLight.raise(window.id, pid: window.pid) {
+            // Fallback if the process couldn't be resolved.
+            if let axWindow = window.axElement {
+                AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+                AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
+            }
+            NSRunningApplication(processIdentifier: window.pid)?.activate(options: [])
+        }
     }
 }
